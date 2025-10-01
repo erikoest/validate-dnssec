@@ -1,0 +1,12 @@
+[package]
+name = "validate-dnssec"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+zoneparser = "*"
+base64 = "*"
+openssl = "*"
+chrono = "*"
+data-encoding = "*"
+hex = "*"
