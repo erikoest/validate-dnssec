@@ -6,6 +6,10 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::cmp;
 use std::env;
+use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
+use crossbeam_channel::{unbounded, Sender, Receiver};
+use std::thread::spawn;
 
 use base64::prelude::*;
 use chrono::prelude::*;
@@ -18,6 +22,7 @@ use openssl::md::Md;
 use openssl::md_ctx::MdCtx;
 use openssl::bn::BigNum;
 use openssl::ecdsa::EcdsaSig;
+use openssl::rsa::Rsa;
 
 use zoneparser::{ZoneParser, Record, RecordData, RRType};
 
@@ -25,11 +30,6 @@ use zoneparser::{ZoneParser, Record, RecordData, RRType};
   be grouped by name. It is also expected that the apex records,
   having the key set, comes before all the other record sets.
  */
-
-enum DnsPubKey {
-    ECDSA(PKey<Public>),
-    None,
-}
 
 #[derive(Eq)]
 struct NsecLink {
@@ -118,7 +118,7 @@ impl NsecLink {
     }
 }
 
-#[derive(Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 struct Signature {
     wire_data: Vec<u8>,
     algorithm: u8,
@@ -129,13 +129,13 @@ struct Signature {
 
 impl Signature {
     fn from_record(rr: &Record, p: &ZoneParser, now_epoch: u32,
-                   verbose: bool) -> Self {
+                   verbose: bool) -> Result<Self, &'static str> {
         let mut sdata: Vec<u8> = vec!();
         for d in &rr.data[8..] {
-            sdata.append(&mut BASE64_STANDARD.decode(&d.data).unwrap());
+            sdata.append(&mut BASE64_STANDARD.decode(&d.data).map_err(|_| "Invalid base64 encoding")?);
         }
 
-        let wdata = p.rdata_to_wireformat(rr, now_epoch).into_bytes();
+        let wdata = p.rdata_to_wireformat(rr, now_epoch)?.into_bytes();
         let alg = wdata[2];
         let keytag: u16 = rr.data[6].data.parse().unwrap();
         let name;
@@ -146,34 +146,60 @@ impl Signature {
             name = "".to_string();
         }
 
-        Self {
+        Ok(Self {
             wire_data: wdata,
             algorithm: alg,
             keytag: keytag,
             sig_data: sdata,
             name: name,
-        }
+        })
     }
 }
 
+#[derive(Clone)]
 struct DnsKey {
     algorithm: u8,
-    pubkey: DnsPubKey,
+    pubkey: PKey<Public>,
     keytag: u16,
 }
 
 impl DnsKey {
-    fn from_record(rr: &Record, p: &ZoneParser) -> Self {
-        let algorithm = rr.data[2].data.parse().expect("Algorithm number");
+    fn from_record(rr: &Record, p: &ZoneParser) -> Result<Self, &'static str> {
+        let algorithm = rr.data[2].data.parse().map_err(|_| "Bad algorithm number")?;
+
+        let mut bytes: Vec<u8> = vec!();
+        for d in &rr.data[3..] {
+            bytes.append(&mut BASE64_STANDARD.decode(&d.data)
+                         .map_err(|_| "Invalid base64 encoding")?);
+        }
 
         let pubkey = match algorithm {
-            13 => {
-                let mut bytes: Vec<u8> = vec!();
-                for d in &rr.data[3..] {
-                    bytes.append(&mut BASE64_STANDARD.decode(&d.data)
-                                 .expect("Key b64decode"));
+            5 | 8 => {
+                // RSASHA1
+                let e_start;
+                let e_len;
+
+                if bytes[0] == 0 {
+                    e_start = 3;
+                    e_len = (bytes[1] << 8 + bytes[2]) as usize;
+                }
+                else {
+                    e_start = 1;
+                    e_len = bytes[0] as usize;
                 }
 
+                let e = &bytes[e_start..e_start + e_len];
+                let n = &bytes[e_start + e_len..];
+
+                let rsa = Rsa::from_public_components(
+                    BigNum::from_slice(n).unwrap(),
+                    BigNum::from_slice(e).unwrap(),
+                ).unwrap();
+
+                PKey::from_rsa(rsa).unwrap()
+            },
+            13 => {
+                // ECDSAP256SHA256
                 let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)
                     .unwrap();
                 let eckey = EcKey::from_public_key_affine_coordinates(
@@ -183,27 +209,26 @@ impl DnsKey {
                 ).unwrap();
                 eckey.check_key().unwrap();
 
-                let key = PKey::from_ec_key(eckey).unwrap();
-                DnsPubKey::ECDSA(key)
+                PKey::from_ec_key(eckey).unwrap()
             },
             _ => {
-                DnsPubKey::None
+                panic!("Don't know algorithm {}", algorithm);
             },
         };
 
-        let keytag = DnsKey::calc_keytag(&rr, p);
+        let keytag = DnsKey::calc_keytag(&rr, p)?;
 
-        Self {
+        Ok(Self {
             algorithm: algorithm,
             pubkey: pubkey,
             keytag: keytag,
-        }
+        })
     }
 
-    fn calc_keytag(rr: &Record, p: &ZoneParser) -> u16 {
+    fn calc_keytag(rr: &Record, p: &ZoneParser) -> Result<u16, &'static str> {
         let mut tag: u32 = 0;
 
-        let key = p.rdata_to_wireformat(rr, 0).into_bytes();
+        let key = p.rdata_to_wireformat(rr, 0)?.into_bytes();
 
         for i in 0..key.len() {
             if (i & 1) > 0 {
@@ -216,11 +241,11 @@ impl DnsKey {
 
         tag += (tag >> 16) & 0xFFFF;
 
-        return (tag & 0xFFFF) as u16;
+        return Ok((tag & 0xFFFF) as u16);
     }
 }
 
-#[derive(Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 struct WireRecord {
     bytes: Vec<u8>,
 }
@@ -324,7 +349,7 @@ impl WireRecord {
     }
 }
 
-#[derive(Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 struct SignedSet {
     wire_data: Vec<WireRecord>,
     sig: Vec<Signature>,
@@ -364,12 +389,15 @@ impl SignedSet {
     }
 }
 
+type CheckSigReceiver = Receiver<SignedSet>;
+type FailuresSender = Sender<u32>;
+
 // Extension to the ZoneParser for building wire format records
 trait ToWireFormat {
-    fn to_wireformat(&self, rr: &Record) -> WireRecord;
-    fn rdata_to_wireformat(&self, rr: &Record, now_epoch: u32) -> WireRecord;
+    fn to_wireformat(&self, rr: &Record) -> Result<WireRecord, &'static str>;
+    fn rdata_to_wireformat(&self, rr: &Record, now_epoch: u32) -> Result<WireRecord, &'static str>;
     fn add_rdata(&self, rr: &Record, bytes: &mut Vec<u8>,
-                 now_epoch: u32) -> u16;
+                 now_epoch: u32) -> Result<u16, &'static str>;
     fn add_type_bitmap(&self, bytes: &mut Vec<u8>, rd: &[RecordData]) -> u16;
     fn add_domain_name_canonical(&self, bytes: &mut Vec<u8>,
                                  name: &str) -> u16;
@@ -387,7 +415,7 @@ trait ToWireFormat {
 }
 
 impl ToWireFormat for ZoneParser<'_> {
-    fn to_wireformat(&self, rr: &Record) -> WireRecord {
+    fn to_wireformat(&self, rr: &Record) -> Result<WireRecord, &'static str> {
         let mut bytes = vec!();
 
         // name
@@ -404,27 +432,27 @@ impl ToWireFormat for ZoneParser<'_> {
         bytes.push(0);
         bytes.push(0);
 
-        let len = self.add_rdata(rr, &mut bytes, 0);
+        let len = self.add_rdata(rr, &mut bytes, 0)?;
 
         bytes[rdlength_pos] = (len >> 8) as u8;
         bytes[rdlength_pos + 1] = (len & 255) as u8;
 
-        WireRecord {
+        Ok(WireRecord {
             bytes: bytes,
-        }
+        })
     }
 
-    fn rdata_to_wireformat(&self, rr: &Record, now_epoch: u32) -> WireRecord {
+    fn rdata_to_wireformat(&self, rr: &Record, now_epoch: u32) -> Result<WireRecord, &'static str> {
         let mut bytes = vec!();
-        let _ = self.add_rdata(rr, &mut bytes, now_epoch);
+        let _ = self.add_rdata(rr, &mut bytes, now_epoch)?;
 
-        WireRecord {
+        Ok(WireRecord {
             bytes: bytes,
-        }
+        })
     }
     
     fn add_rdata(&self, rr: &Record, bytes: &mut Vec<u8>,
-                 now_epoch: u32) -> u16 {
+                 now_epoch: u32) -> Result<u16, &'static str> {
         let mut len: u16 = 0;
 
         // RecordData in canonical form
@@ -470,7 +498,7 @@ impl ToWireFormat for ZoneParser<'_> {
             },
             RRType::A => {
                 // address, u32
-                let addr: Ipv4Addr = rr.data[0].data.parse().unwrap();
+                let addr: Ipv4Addr = rr.data[0].data.parse().map_err(|_| "Bad address")?;
 
                 for o in addr.octets() {
                     bytes.push(o);
@@ -480,7 +508,7 @@ impl ToWireFormat for ZoneParser<'_> {
             },
             RRType::AAAA => {
                 // Complete address, u128
-                let addr: Ipv6Addr = rr.data[0].data.parse().unwrap();
+                let addr: Ipv6Addr = rr.data[0].data.parse().map_err(|_| "Bad address")?;
 
                 for o in addr.octets() {
                     bytes.push(o);
@@ -532,7 +560,7 @@ impl ToWireFormat for ZoneParser<'_> {
                 len += self.add_u8_rdata(bytes, &rr.data[2]);
                 // Pubkey, &[u8]
                 for d in &rr.data[3..] {
-                    let pk = &mut BASE64_STANDARD.decode(&d.data).unwrap();
+                    let pk = &mut BASE64_STANDARD.decode(&d.data).map_err(|_| "Invalid base64 encoding")?;
                     len += pk.len() as u16;
                     bytes.append(pk);
                 }
@@ -546,7 +574,7 @@ impl ToWireFormat for ZoneParser<'_> {
                 len += self.add_u8_rdata(bytes, &rr.data[2]);
                 // Digest
                 for d in &rr.data[3..] {
-                    let dig = &mut hex::decode(&d.data).unwrap();
+                    let dig = &mut hex::decode(&d.data).map_err(|_| "Bad hex encoding")?;
                     len += dig.len() as u16;
                     bytes.append(dig);
                 }
@@ -565,15 +593,15 @@ impl ToWireFormat for ZoneParser<'_> {
                     len += 1;
                 }
                 else {
-                    let mut salt = rr.data[3].data.clone().into_bytes();
+                    let mut salt = hex::decode(&rr.data[3].data).map_err(|_| "Bad hex encoding")?;
                     bytes.push(salt.len() as u8);
-                    bytes.append(&mut salt);
                     len += salt.len() as u16 + 1;
+                    bytes.append(&mut salt);
                 }
                 // Hash length, u8
                 // Next hashed owner name &[u8],
                 let mut hname = BASE32_DNSSEC.decode(
-                    &rr.data[4].data.as_bytes()).unwrap();
+                    &rr.data[4].data.as_bytes()).map_err(|_| "Bad base32 encoding")?;
                 bytes.push(hname.len() as u8);
                 len += hname.len() as u16 + 1;
                 bytes.append(&mut hname);
@@ -601,10 +629,10 @@ impl ToWireFormat for ZoneParser<'_> {
                     len += 1;
                 }
                 else {
-                    let mut salt = rr.data[3].data.clone().into_bytes();
+                    let mut salt = hex::decode(&rr.data[3].data).map_err(|_| "Bad hex encoding")?;
                     bytes.push(salt.len() as u8);
-                    bytes.append(&mut salt);
                     len += salt.len() as u16 + 1;
+                    bytes.append(&mut salt);
                 }
             },
             RRType::RRSIG => {
@@ -649,7 +677,7 @@ impl ToWireFormat for ZoneParser<'_> {
                 len += self.add_u8_rdata(bytes, &rr.data[2]);
                 // Certification data
                 for d in &rr.data[3..] {
-                    let dig = &mut hex::decode(&d.data).unwrap();
+                    let dig = &mut hex::decode(&d.data).map_err(|_| "Bad hex encoding")?;
                     len += dig.len() as u16;
                     bytes.append(dig);
                 }
@@ -659,7 +687,7 @@ impl ToWireFormat for ZoneParser<'_> {
             },
         }
 
-        return len;
+        return Ok(len);
     }
 
     fn add_type_bitmap(&self, bytes: &mut Vec<u8>, rd: &[RecordData]) -> u16 {
@@ -731,6 +759,10 @@ impl ToWireFormat for ZoneParser<'_> {
             let mut lbytes = String::from(label).into_bytes();
             let llength = lbytes.len() as u8;
             bytes.push(llength);
+            // Root domain corner case
+            if llength == 0 {
+                return length + 1;
+            }
             bytes.append(&mut lbytes);
 
             length += llength as u16 + 1;
@@ -767,6 +799,10 @@ impl ToWireFormat for ZoneParser<'_> {
             let mut lbytes = String::from(label).into_bytes();
             let llength = lbytes.len() as u8;
             bytes.push(llength as u8);
+            // Root domain corner case
+            if llength == 0 {
+                return length + 1;
+            }
             bytes.append(&mut lbytes);
 
             length += llength as u16 + 1;
@@ -812,6 +848,104 @@ impl ToWireFormat for ZoneParser<'_> {
     }
 }
 
+fn verify_signature(keys: &Vec<DnsKey>, ss: &mut SignedSet, verbose: bool) -> u32 {
+    ss.sort_data();
+
+    let mut sig_failures = 0;
+
+    for sig in &ss.sig {
+        let mut keys_matched = 0;
+
+        for dnskey in keys {
+            if sig.keytag != dnskey.keytag {
+                continue;
+            }
+
+            keys_matched += 1;
+
+            let digest = match &dnskey.algorithm {
+                5 => { // RSASHA1
+                    Md::sha1()
+                },
+                8 | 13 => { // ECDSAP256SHA256
+                    Md::sha256()
+                },
+                _ => {
+                    panic!("Unknown dnskey algorithm {}", dnskey.algorithm);
+                },
+            };
+
+            let mut ctx = MdCtx::new().unwrap();
+            ctx.digest_verify_init(Some(&digest), &dnskey.pubkey).unwrap();
+            ctx.digest_verify_update(&sig.wire_data).unwrap();
+
+            for wd in &ss.wire_data {
+                ctx.digest_verify_update(&wd.bytes).unwrap();
+            }
+
+            let result = match &dnskey.algorithm {
+                5 | 8 => {
+                    ctx.digest_verify_final(&sig.sig_data)
+                },
+                13 => {
+                    let esig = &EcdsaSig::from_private_components(
+                        BigNum::from_slice(&sig.sig_data[0..32]).unwrap(),
+                        BigNum::from_slice(&sig.sig_data[32..64]).unwrap(),
+                    ).unwrap();
+                    ctx.digest_verify_final(&esig.to_der().unwrap())
+                },
+                _ => {
+                    panic!("Unknown dnskey algorithm {}", dnskey.algorithm);
+                },
+            };
+
+            match result {
+                Ok(verify_ok) => {
+                    if verify_ok {
+                        if verbose {
+                            println!("Signature {} is valid",
+                                     sig.name);
+                        }
+                    }
+                    else {
+                        if verbose {
+                            println!("Signature {} is not valid",
+                                     sig.name);
+                        }
+                        sig_failures += 1;
+                    }
+                },
+                Err(_) => {
+                    if verbose {
+                        println!(
+                            "Verification of signature {}", sig.name);
+                        // println!("Sig data {}", hex::encode(bytes));
+                    }
+                    sig_failures += 1;
+                },
+            }
+
+            if keys_matched == 0 {
+                if verbose {
+                    println!("No keys matched signature {}", sig.name);
+                }
+                sig_failures += 1;
+            }
+        }
+    }
+
+    return sig_failures;
+}
+
+fn verify_signatures(keys: Vec<DnsKey>, rx: CheckSigReceiver, tx: FailuresSender, verbose: bool) {
+    for mut sset in rx.iter() {
+        let failures = verify_signature(&keys, &mut sset, verbose);
+        if failures > 0 {
+            tx.send(failures).unwrap();
+        }
+    }
+}
+
 /* Iterator which gets rrset on each iteration. In a strict sense,
 this struct is not an iterator (it does not implement the iterator
 trait). Also, it does not return the next item. Rather, it keeps it
@@ -830,8 +964,10 @@ struct SetIterator<'a> {
     name_count: u32,
     key_count: u32,
     sig_count: u32,
+    nsec_count: u32,
     sig_failures: u32,
     nsec_failures: u32,
+    invalid_rrs: u32,
     now_epoch: u32,
     verbose: bool,
 }
@@ -852,7 +988,9 @@ impl<'a> SetIterator<'a> {
             key_count: 0,
             sig_count: 0,
             sig_failures: 0,
+            nsec_count: 0,
             nsec_failures: 0,
+            invalid_rrs: 0,
             now_epoch: now_epoch,
             verbose: verbose,
 	}
@@ -864,7 +1002,9 @@ impl<'a> SetIterator<'a> {
         println!("Keys found: {}", self.key_count);
         println!("Signatures verified: {}", self.sig_count);
         println!("Signatures failed: {}", self.sig_failures);
+        println!("Nsec/nsec3 records verified: {}", self.nsec_count);
         println!("Nsec/nsec3 broken links: {}", self.nsec_failures);
+        println!("Invalid records: {}", self.invalid_rrs);
     }
 
     fn fetch_next_name(&mut self) -> Vec<Record> {
@@ -890,7 +1030,15 @@ impl<'a> SetIterator<'a> {
         return set;
     }
 
-    fn check_zone(&mut self) {
+    fn check_zone(&mut self, nthreads: usize) {
+        let mut threads = Vec::new();
+        let mut senders = Vec::new();
+
+        let mut ti = 0;
+        let verbose = self.verbose;
+
+        let (failures_tx, failures_rx) = unbounded();
+
         loop {
             let set = self.fetch_next_name();
             if set.is_empty() {
@@ -902,9 +1050,31 @@ impl<'a> SetIterator<'a> {
             // Get keys
             for rr in &set {
 	        if rr.rrtype == RRType::DNSKEY {
-		    self.keys.push(DnsKey::from_record(&rr, &self.parser));
-                    self.key_count += 1;
+                    let r_key  = DnsKey::from_record(&rr, &self.parser);
+                    match r_key {
+                        Ok(key) => {
+		            self.keys.push(key);
+                            self.key_count += 1;
+                        }
+                        Err(e) => {
+                            if self.verbose {
+                                println!("Invalid record {}: {}", rr, e);
+                            }
+                            self.invalid_rrs += 1
+                        }
+                    }
 	        }
+            }
+
+            if nthreads > 1 && senders.len() == 0 {
+                for _ in 0..nthreads {
+                    let (sset_tx, sset_rx) = unbounded();
+                    let keys = self.keys.clone();
+                    let f_tx = failures_tx.clone();
+                    senders.push(sset_tx);
+                    let t = spawn(move || verify_signatures(keys, sset_rx, f_tx, verbose));
+                    threads.push(t);
+                }
             }
 
 	    let mut hashed: HashMap<RRType, SignedSet> = HashMap::new();
@@ -917,12 +1087,20 @@ impl<'a> SetIterator<'a> {
                     if !hashed.contains_key(&rrtype) {
                         hashed.insert(rrtype, SignedSet::new());
                     }
-                    hashed.get_mut(&rrtype).unwrap().add_sig(
-                        Signature::from_record(
-                            &rr, &self.parser, self.now_epoch, self.verbose));
-                    self.sig_count += 1;
+                    let r_sig = Signature::from_record(&rr, &self.parser, self.now_epoch, self.verbose);
+                    match r_sig {
+                        Ok(sig) => {
+                            hashed.get_mut(&rrtype).unwrap().add_sig(sig);
+                            self.sig_count += 1;
+                        }
+                        Err(e) => {
+                            if self.verbose {
+                                println!("Invalid record {}: {}", rr, e);
+                            }
+                            self.invalid_rrs += 1;
+                        }
+                    }
                 }
-                
             }
 
             // Collect signed records and nsec/nsec3 records
@@ -940,20 +1118,58 @@ impl<'a> SetIterator<'a> {
                 }
                 
                 if let Some(sig) = hashed.get_mut(&rr.rrtype) {
-                    sig.add_data(
-                        self.parser.to_wireformat(&rr));
+                    let wire_r = self.parser.to_wireformat(&rr);
+                    match wire_r {
+                        Ok(wire) => {
+                            sig.add_data(wire);
+                        },
+                        Err(e) => {
+                            // FIXME: Don't count errors twice
+                            if self.verbose {
+                                println!("Invalid record {}: {}", rr, e);
+                            }
+                            self.invalid_rrs += 1;
+                        }
+                    }
                 }
             }
 
             // Validate each signature
             for sset in hashed.values_mut() {
-                self.verify_signature(sset);
+                if nthreads > 1 {
+                    senders[ti].send(sset.clone()).unwrap();
+                    ti = (ti + 1)%nthreads;
+
+                    for f in failures_rx.try_iter() {
+                        self.sig_failures += f;
+                    }
+                }
+                else {
+                    self.sig_failures += verify_signature(&self.keys, sset, self.verbose);
+                }
             }
         }
 
-        self.nsec_chain.sort();
+        // Finish threads
+        if nthreads > 1 {
+            for s in senders {
+                drop(s);
+            }
+
+            for t in threads {
+                t.join().unwrap();
+            }
+
+            for f in failures_rx.try_iter() {
+                self.sig_failures += f;
+            }
+        }
+
+        ThreadPoolBuilder::new().num_threads(nthreads).build_global().unwrap();
+        self.nsec_chain.par_sort();
 
         let mut somelast: Option<&NsecLink> = None;
+        self.nsec_count = self.nsec_chain.len() as u32;
         for link in self.nsec_chain.iter() {
             if let Some(last) = somelast {
                 if last.next != link.name {
@@ -979,71 +1195,10 @@ impl<'a> SetIterator<'a> {
             }
         }
     }
-
-    fn verify_signature(&mut self, ss: &mut SignedSet) {
-        ss.sort_data();
-
-        for sig in &ss.sig {
-            for dnskey in &self.keys {
-                if sig.keytag != dnskey.keytag {
-                    continue;
-                }
-        
-                match &dnskey.pubkey {
-                    DnsPubKey::ECDSA(key) => {
-                        // ECDSAP256SHA256
-                        let mut ctx = MdCtx::new().unwrap();
-                        ctx.digest_verify_init(Some(Md::sha256()),
-                                               &key).unwrap();
-                        ctx.digest_verify_update(&sig.wire_data).unwrap();
-                    
-                        for wd in &ss.wire_data {
-                            ctx.digest_verify_update(&wd.bytes).unwrap();
-                        }
-
-                        let esig = EcdsaSig::from_private_components(
-                            BigNum::from_slice(&sig.sig_data[0..32]).unwrap(),
-                            BigNum::from_slice(&sig.sig_data[32..64]).unwrap(),
-                        ).unwrap();
-
-                        match ctx.digest_verify_final(&esig.to_der().unwrap()) {
-                            Ok(verify_ok) => {
-                                if verify_ok {
-                                    if self.verbose {
-                                        println!("Signature {} is valid",
-                                                 sig.name);
-                                    }
-                                }
-                                else {
-                                    if self.verbose {
-                                        println!("Signature {} is not valid",
-                                                 sig.name);
-                                    }
-                                    self.sig_failures += 1;
-                                }
-                            },
-                            Err(_) => {
-                                if self.verbose {
-                                    println!(
-                                        "Verification of signature {} failed",
-                                        sig.name);
-                                    // println!("Data {}", hex::encode(bytes));
-                                }
-                                self.sig_failures += 1;
-                            },
-                        }
-                    },
-                    _ => {
-                        panic!("Unknown dnskey algorithm {}", dnskey.algorithm);
-                    },
-                }
-            }
-        }
-    }
 }
 
 fn usage() {
-    println!("Usage: validate_dnssec [-o origin] [-t] [-v] <signed zonefile>");
+    println!("Usage: validate_dnssec [-o origin] [-t] [-v] [-n threads] <signed zonefile>");
 }
 
 fn main() {
@@ -1052,6 +1207,7 @@ fn main() {
     let mut origin = "";
     let mut verbose = false;
     let mut now_epoch: u32 = Utc::now().timestamp() as u32;
+    let mut nthreads:usize = 1;
     let mut arg_count = 1;
 
     loop {
@@ -1067,6 +1223,11 @@ fn main() {
 		    arg_count += 2;
                     continue;
 	        },
+                "-n" | "--threads" => {
+                    nthreads = args[arg_count + 1].parse().unwrap();
+                    arg_count += 2;
+                    continue;
+                }
                 &_ => { }
             }
         }
@@ -1098,6 +1259,6 @@ fn main() {
 
     let mut si = SetIterator::new(&file, origin, now_epoch, verbose);
 
-    si.check_zone();
+    si.check_zone(nthreads);
     si.print_stats();
 }
