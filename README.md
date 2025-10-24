@@ -1,7 +1,7 @@
 # Validate-DNSSEC: A dnssec validator for zonefiles
 
 The validate-dnssec command line tool validates dnssec signatures
-and nsec/nsec3 chains in a zonefiles.
+and nsec/nsec3 chains in a zonefile.
 
 ## Usage
 
