@@ -421,7 +421,7 @@ impl ToWireFormat for ZoneParser<'_> {
         // name
         self.add_domain_name_canonical(&mut bytes, &rr.name);
         // type
-        self.add_u16_canonical(&mut bytes, rr.rrtype as u16);
+        self.add_u16_canonical(&mut bytes, rr.rrtype.discriminant());
         // class
         self.add_u16_canonical(&mut bytes, rr.class as u16);
         // ttl
@@ -638,7 +638,8 @@ impl ToWireFormat for ZoneParser<'_> {
             RRType::RRSIG => {
                 // Type covered, u16
                 len += self.add_u16_canonical(
-                    bytes, self.rrtype_from_str(&rr.data[0].data) as u16);
+                    bytes, self.rrtype_from_str(
+                        &rr.data[0].data).discriminant());
                 // Algorithm, u8
                 len += self.add_u8_rdata(bytes, &rr.data[1]);
                 // Labels, u8
@@ -683,7 +684,22 @@ impl ToWireFormat for ZoneParser<'_> {
                 }
             },
             _ => {
-                panic!("Unknown RRType {}", rr.rrtype);
+                // Assuming anonymous type with 'TYPEXXX \# MM NNNN' syntax
+                // Require first field to be '#'
+                if rr.data[0].data != "#" {
+                    return Err("Bad rdata");
+                }
+                let length = rr.data[1].data.parse::<usize>().map_err(
+                    |_| "Bad rdata length field")?;
+                let data = hex::decode(&rr.data[2].data).map_err(
+                    |_| "Bad rdata hex data")?;
+                // Require data length to match the length field
+                if data.len() != length {
+                    return Err("Bad rdata");
+                }
+                for i in 0..length {
+                    len += self.add_u8_canonical(bytes, data[i]);
+                }
             },
         }
 
@@ -741,13 +757,12 @@ impl ToWireFormat for ZoneParser<'_> {
                 bytes.push(bm1array[i]);
             }
             if bmlen > 16 {
-                for i in 0..bmlen - 17 {
+                for i in 0..bmlen - 16 {
                     bytes.push(bm2array[i]);
                 }
             }
             len += bmlen as u16 + 2;
         }
-
         return len;
     }
 
@@ -755,7 +770,7 @@ impl ToWireFormat for ZoneParser<'_> {
                                  name: &str) -> u16 {
         let mut length = 0;
 
-        for label in self.absolute_name(&name).to_lowercase().split(".") {
+        for label in name.to_lowercase().split(".") {
             let mut lbytes = String::from(label).into_bytes();
             let llength = lbytes.len() as u8;
             bytes.push(llength);
@@ -915,10 +930,10 @@ fn verify_signature(keys: &Vec<DnsKey>, ss: &mut SignedSet, verbose: bool) -> u3
                         sig_failures += 1;
                     }
                 },
-                Err(_) => {
+                Err(e) => {
                     if verbose {
                         println!(
-                            "Verification of signature {}", sig.name);
+                            "Verification of signature {}: {}", sig.name, e);
                         // println!("Sig data {}", hex::encode(bytes));
                     }
                     sig_failures += 1;
