@@ -129,7 +129,7 @@ struct Signature {
 
 impl Signature {
     fn from_record(rr: &Record, p: &ZoneParser, now_epoch: u32,
-                   verbose: bool) -> Result<Self, &'static str> {
+                   verbose: bool) -> Result<Self, String> {
         let mut sdata: Vec<u8> = vec!();
         for d in &rr.data[8..] {
             sdata.append(&mut BASE64_STANDARD.decode(&d.data).map_err(|_| "Invalid base64 encoding")?);
@@ -164,7 +164,7 @@ struct DnsKey {
 }
 
 impl DnsKey {
-    fn from_record(rr: &Record, p: &ZoneParser) -> Result<Self, &'static str> {
+    fn from_record(rr: &Record, p: &ZoneParser) -> Result<Self, String> {
         let algorithm = rr.data[2].data.parse().map_err(|_| "Bad algorithm number")?;
 
         let mut bytes: Vec<u8> = vec!();
@@ -225,7 +225,7 @@ impl DnsKey {
         })
     }
 
-    fn calc_keytag(rr: &Record, p: &ZoneParser) -> Result<u16, &'static str> {
+    fn calc_keytag(rr: &Record, p: &ZoneParser) -> Result<u16, String> {
         let mut tag: u32 = 0;
 
         let key = p.rdata_to_wireformat(rr, 0)?.into_bytes();
@@ -394,11 +394,12 @@ type FailuresSender = Sender<u32>;
 
 // Extension to the ZoneParser for building wire format records
 trait ToWireFormat {
-    fn to_wireformat(&self, rr: &Record) -> Result<WireRecord, &'static str>;
-    fn rdata_to_wireformat(&self, rr: &Record, now_epoch: u32) -> Result<WireRecord, &'static str>;
+    fn to_wireformat(&self, rr: &Record) -> Result<WireRecord, String>;
+    fn rdata_to_wireformat(&self, rr: &Record, now_epoch: u32) -> Result<WireRecord, String>;
     fn add_rdata(&self, rr: &Record, bytes: &mut Vec<u8>,
-                 now_epoch: u32) -> Result<u16, &'static str>;
-    fn add_type_bitmap(&self, bytes: &mut Vec<u8>, rd: &[RecordData]) -> u16;
+                 now_epoch: u32) -> Result<u16, String>;
+    fn add_type_bitmap(&self, bytes: &mut Vec<u8>, rd: &[RecordData])
+                       -> Result<u16, String>;
     fn add_domain_name_canonical(&self, bytes: &mut Vec<u8>,
                                  name: &str) -> u16;
     fn add_u8_canonical(&self, bytes: &mut Vec<u8>, val: u8) -> u16;
@@ -415,7 +416,7 @@ trait ToWireFormat {
 }
 
 impl ToWireFormat for ZoneParser<'_> {
-    fn to_wireformat(&self, rr: &Record) -> Result<WireRecord, &'static str> {
+    fn to_wireformat(&self, rr: &Record) -> Result<WireRecord, String> {
         let mut bytes = vec!();
 
         // name
@@ -442,7 +443,7 @@ impl ToWireFormat for ZoneParser<'_> {
         })
     }
 
-    fn rdata_to_wireformat(&self, rr: &Record, now_epoch: u32) -> Result<WireRecord, &'static str> {
+    fn rdata_to_wireformat(&self, rr: &Record, now_epoch: u32) -> Result<WireRecord, String> {
         let mut bytes = vec!();
         let _ = self.add_rdata(rr, &mut bytes, now_epoch)?;
 
@@ -452,7 +453,7 @@ impl ToWireFormat for ZoneParser<'_> {
     }
     
     fn add_rdata(&self, rr: &Record, bytes: &mut Vec<u8>,
-                 now_epoch: u32) -> Result<u16, &'static str> {
+                 now_epoch: u32) -> Result<u16, String> {
         let mut len: u16 = 0;
 
         // RecordData in canonical form
@@ -606,14 +607,14 @@ impl ToWireFormat for ZoneParser<'_> {
                 len += hname.len() as u16 + 1;
                 bytes.append(&mut hname);
                 // Type bitmap
-                len += self.add_type_bitmap(bytes, &rr.data[5..]);
+                len += self.add_type_bitmap(bytes, &rr.data[5..])?;
             },
             RRType::NSEC => {
                 // Next domain
                 len += self.add_domain_name_rdata(
                     bytes, &rr.data[0]);
                 // Type bitmap
-                len += self.add_type_bitmap(bytes, &rr.data[1..]);
+                len += self.add_type_bitmap(bytes, &rr.data[1..])?;
             },
             RRType::NSEC3PARAM => {
                 // Hash algorithm, u8
@@ -639,7 +640,7 @@ impl ToWireFormat for ZoneParser<'_> {
                 // Type covered, u16
                 len += self.add_u16_canonical(
                     bytes, self.rrtype_from_str(
-                        &rr.data[0].data).discriminant());
+                        &rr.data[0].data)?.discriminant());
                 // Algorithm, u8
                 len += self.add_u8_rdata(bytes, &rr.data[1]);
                 // Labels, u8
@@ -687,7 +688,7 @@ impl ToWireFormat for ZoneParser<'_> {
                 // Assuming anonymous type with 'TYPEXXX \# MM NNNN' syntax
                 // Require first field to be '#'
                 if rr.data[0].data != "#" {
-                    return Err("Bad rdata");
+                    return Err("Bad rdata".to_string());
                 }
                 let length = rr.data[1].data.parse::<usize>().map_err(
                     |_| "Bad rdata length field")?;
@@ -695,7 +696,7 @@ impl ToWireFormat for ZoneParser<'_> {
                     |_| "Bad rdata hex data")?;
                 // Require data length to match the length field
                 if data.len() != length {
-                    return Err("Bad rdata");
+                    return Err("Bad rdata".to_string());
                 }
                 for i in 0..length {
                     len += self.add_u8_canonical(bytes, data[i]);
@@ -706,17 +707,18 @@ impl ToWireFormat for ZoneParser<'_> {
         return Ok(len);
     }
 
-    fn add_type_bitmap(&self, bytes: &mut Vec<u8>, rd: &[RecordData]) -> u16 {
+    fn add_type_bitmap(&self, bytes: &mut Vec<u8>, rd: &[RecordData])
+                       -> Result<u16, String> {
         if rd.is_empty() {
             // Corner case: No types
-            return 0;
+            return Ok(0);
         }
 
         let mut bm_hash: HashMap<u8, (u128, u128)> = HashMap::new();
         let mut blocks: Vec<u8> = vec!();
 
         for d in rd {
-            let (window_block, bit1, bit2) = self.rrtype_bm_from_str(&d.data);
+            let (window_block, bit1, bit2) = self.rrtype_bm_from_str(&d.data)?;
             if let Some(&(mut bm1, mut bm2)) = bm_hash.get(&window_block) {
                 bm1 |= bit1;
                 bm2 |= bit2;
@@ -763,7 +765,7 @@ impl ToWireFormat for ZoneParser<'_> {
             }
             len += bmlen as u16 + 2;
         }
-        return len;
+        return Ok(len);
     }
 
     fn add_domain_name_canonical(&self, bytes: &mut Vec<u8>,
@@ -989,11 +991,25 @@ struct SetIterator<'a> {
 
 impl<'a> SetIterator<'a> {
     fn new(file: &'a File, origin: &str, now_epoch: u32,
-           verbose: bool) -> Self {
+           verbose: bool) -> Result<Self, String> {
 	let mut parser = ZoneParser::new(&file, origin);
-	let next = parser.next();
+        let next: Option<Record>;
 
-	Self {
+        // Unpack next Option<Result<rr)>>
+	match parser.next() {
+            Some(result) => {
+                if let Err(e) = result {
+                    return Err(e);
+                }
+
+                next = Some(result.unwrap());
+            },
+            None => {
+                next = None;
+            }
+        }
+
+	Ok(Self {
 	    parser: parser,
 	    next: next,
             keys: vec!(),
@@ -1008,7 +1024,7 @@ impl<'a> SetIterator<'a> {
             invalid_rrs: 0,
             now_epoch: now_epoch,
             verbose: verbose,
-	}
+	})
     }
 
     fn print_stats(&self) {
@@ -1022,15 +1038,22 @@ impl<'a> SetIterator<'a> {
         println!("Invalid records: {}", self.invalid_rrs);
     }
 
-    fn fetch_next_name(&mut self) -> Vec<Record> {
+    fn fetch_next_name(&mut self) -> Result<Vec<Record>, String> {
         let mut set = vec!();
 	if self.next.is_some() {
 	    let name = self.next.as_ref().unwrap().name.clone();
 	    while self.next.is_some() {
 		if &self.next.as_ref().unwrap().name == &name {
-		    let nx = self.parser.next();
-		    if nx.is_some() {
-			set.push(self.next.replace(nx.unwrap()).unwrap());
+		    let optnx = self.parser.next();
+		    if let Some(result) = optnx {
+                        match result {
+                            Err(e) => {
+                                return Err(e);
+                            },
+                            Ok(nx) => {
+			        set.push(self.next.replace(nx).unwrap());
+                            },
+                        }
 		    }
 		    else {
 			set.push(self.next.take().unwrap());
@@ -1042,10 +1065,10 @@ impl<'a> SetIterator<'a> {
 		}
 	    }
 	}
-        return set;
+        return Ok(set);
     }
 
-    fn check_zone(&mut self, nthreads: usize) {
+    fn check_zone(&mut self, nthreads: usize) -> Result<(), String> {
         let mut threads = Vec::new();
         let mut senders = Vec::new();
 
@@ -1055,7 +1078,7 @@ impl<'a> SetIterator<'a> {
         let (failures_tx, failures_rx) = unbounded();
 
         loop {
-            let set = self.fetch_next_name();
+            let set = self.fetch_next_name()?;
             if set.is_empty() {
                 break;
             }
@@ -1098,7 +1121,7 @@ impl<'a> SetIterator<'a> {
             for rr in &set {
                 if rr.rrtype == RRType::RRSIG {
                     let rrtype = self.parser.rrtype_from_str(
-                        &rr.data[0].data);
+                        &rr.data[0].data)?;
                     if !hashed.contains_key(&rrtype) {
                         hashed.insert(rrtype, SignedSet::new());
                     }
@@ -1209,6 +1232,8 @@ impl<'a> SetIterator<'a> {
                 self.nsec_failures += 1;
             }
         }
+
+        return Ok(());
     }
 }
 
@@ -1272,8 +1297,13 @@ fn main() {
 
     let file = File::open(&args[arg_count]).unwrap();
 
-    let mut si = SetIterator::new(&file, origin, now_epoch, verbose);
-
-    si.check_zone(nthreads);
-    si.print_stats();
+    match SetIterator::new(&file, origin, now_epoch, verbose) {
+        Err(e) => {
+            println!("{}", e);
+        },
+        Ok(mut si) => {
+            si.check_zone(nthreads).unwrap();
+            si.print_stats();
+        },
+    }
 }
